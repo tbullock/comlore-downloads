@@ -1,0 +1,344 @@
+--- sys/dev/pci/drm/radeon/radeon.h
++++ sys/dev/pci/drm/radeon/radeon.h
+@@ -2326,6 +2326,7 @@ struct radeon_device {
+ 	bus_space_tag_t			memt;
+ 	bus_dma_tag_t			dmat;
+ 	void				*irqh;
++	bool				dma_limited;
+ 
+ 	void				(*switchcb)(void *, int, int);
+ 	void				*switchcbarg;
+--- sys/dev/pci/drm/radeon/radeon_device.c
++++ sys/dev/pci/drm/radeon/radeon_device.c
+@@ -1392,6 +1392,13 @@ int radeon_device_init(struct radeon_device *rdev,
+ 	}
+ 	rdev->need_swiotlb = drm_need_swiotlb(dma_bits);
+ 
++	/* disabling sparc64 iommu requires 64 bits */
++#ifdef __sparc64__
++	rdev->dma_limited = true;
++#else
++	rdev->dma_limited = dma_bits <= 32;
++#endif
++
+ 	/* Registers mapping */
+ 	/* TODO: block userspace mapping of io register */
+ 	mtx_init(&rdev->mmio_idx_lock, IPL_TTY);
+--- sys/dev/pci/drm/radeon/radeon_ttm.c
++++ sys/dev/pci/drm/radeon/radeon_ttm.c
+@@ -717,7 +717,7 @@ int radeon_ttm_init(struct radeon_device *rdev)
+ 			       /*rdev_to_drm(rdev)->anon_inode->i_mapping*/NULL,
+ 			       rdev_to_drm(rdev)->vma_offset_manager,
+ 			       rdev->need_swiotlb,
+-			       dma_addressing_limited(&rdev->pdev->dev));
++			       rdev->dma_limited);
+ #endif
+ 	if (r) {
+ 		DRM_ERROR("failed initializing buffer object driver(%d).\n", r);
+--- sys/dev/pci/drm/radeon/radeon_display.c
++++ sys/dev/pci/drm/radeon/radeon_display.c
+@@ -34,10 +34,12 @@
+ #include <drm/drm_device.h>
+ #include <drm/drm_drv.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_fb_helper.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_modeset_helper.h>
++#include <drm/drm_plane_helper.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+ #include <drm/radeon_drm.h>
+@@ -626,6 +628,11 @@
+ 	struct drm_crtc *crtc;
+ 	bool active = false;
+ 	int ret;
++#ifdef __sparc64__
++	const unsigned char *p;
++	uint16_t *r, *g, *b;
++	int i;
++#endif
+ 
+ 	if (!set || !set->crtc)
+ 		return -EINVAL;
+@@ -639,6 +646,26 @@
+ 	}
+ 
+ 	ret = drm_crtc_helper_set_config(set, ctx);
++
++#ifdef __sparc64__
++	/* When returning from X, we may need to restore the colour table. */
++	if (ret == 0 && set->fb &&
++	    set->fb->format->format == DRM_FORMAT_C8) {
++		if (dev->fb_helper && set->fb == dev->fb_helper->fb) {
++			p = rasops_cmap;
++			r = set->crtc->gamma_store;
++			g = r + set->crtc->gamma_size;
++			b = g + set->crtc->gamma_size;
++
++			for (i = 0; i < 256; i++) {
++				r[i] = *p++ << 8;
++				g[i] = *p++ << 8;
++				b[i] = *p++ << 8;
++			}
++			radeon_crtc_load_lut(set->crtc);
++		}
++	}
++#endif
+ 
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
+ 		if (crtc->enabled)
+@@ -678,10 +705,69 @@
+ 	.get_vblank_timestamp = drm_crtc_vblank_helper_get_vblank_timestamp,
+ };
+ 
++/*
++ * Sun firmware typically selects an indexed pixel format for its console.
++ * drm_crtc_init() advertises only 32-bit formats, so fbdev rejects C8
++ * despite driver support.  Add C8 for fbdev.
++ */
++#ifdef __sparc64__
++static const uint32_t sparc_fmt[3] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_C8
++};
++
++/*
++ * The primary DRM plane scans out the framebuffer to the display.  We will
++ * use this modesetting operation since we just need the 8bit C8 pixel
++ * format to be compatible with the Sun firmware.
++ */
++static const struct drm_plane_funcs sparc_plane_funcs = {
++	DRM_PLANE_NON_ATOMIC_FUNCS,
++};
++
++static int
++radeon_crtc_init_indexed(struct drm_device *dev, struct drm_crtc *crtc)
++{
++	struct drm_plane *primary;
++	int ret;
++
++	primary = __drm_universal_plane_alloc(
++	    dev,
++	    sizeof(*primary),
++	    0,
++	    0,
++	    &sparc_plane_funcs,
++	    sparc_fmt,
++	    ARRAY_SIZE(sparc_fmt),
++	    NULL,
++	    DRM_PLANE_TYPE_PRIMARY,
++	    NULL);
++	if (IS_ERR(primary))
++		return PTR_ERR(primary);
++
++	/* Incomplete pixel format list */
++	primary->format_default = true;
++	ret = drm_crtc_init_with_planes(
++	    dev,
++	    crtc,
++	    primary,
++	    NULL,
++	    &radeon_crtc_funcs,
++	    NULL);
++	if (ret != 0) {
++		drm_plane_cleanup(primary);
++		kfree(primary);
++	}
++	return ret;
++}
++#endif
++
+ static void radeon_crtc_init(struct drm_device *dev, int index)
+ {
+ 	struct radeon_device *rdev = dev->dev_private;
+ 	struct radeon_crtc *radeon_crtc;
++	int ret;
+ 
+ 	radeon_crtc = kzalloc(sizeof(*radeon_crtc), GFP_KERNEL);
+ 	if (radeon_crtc == NULL)
+@@ -693,7 +779,17 @@
+ 		return;
+ 	}
+ 
+-	drm_crtc_init(dev, &radeon_crtc->base, &radeon_crtc_funcs);
++	/* Advertise C8 for the SPARC console preference. */
++#ifdef __sparc64__
++	ret = radeon_crtc_init_indexed(dev, &radeon_crtc->base);
++#else
++	ret = drm_crtc_init(dev, &radeon_crtc->base, &radeon_crtc_funcs);
++#endif
++	if (ret != 0) {
++		destroy_workqueue(radeon_crtc->flip_queue);
++		kfree(radeon_crtc);
++		return;
++	}
+ 
+ 	drm_mode_crtc_set_gamma_size(&radeon_crtc->base, 256);
+ 	radeon_crtc->crtc_id = index;
+--- sys/dev/pci/drm/radeon/radeon_drv.c
++++ sys/dev/pci/drm/radeon/radeon_drv.c
+@@ -742,9 +742,6 @@
+     void (*)(void *, int, int), void *);
+ void radeondrm_doswitch(void *);
+ void radeondrm_enter_ddb(void *, void *);
+-#ifdef __sparc64__
+-void radeondrm_setcolor(void *, u_int, u_int8_t, u_int8_t, u_int8_t);
+-#endif
+ void radeondrm_setpal(struct radeon_device *, struct rasops_info *);
+ 
+ struct wsscreen_descr radeondrm_stdscreen = {
+@@ -863,11 +860,7 @@
+ 	struct radeon_device *rdev = ri->ri_hw;
+ 
+ 	rasops_show_screen(ri, rdev->switchcookie, 0, NULL, NULL);
+-#ifdef __sparc64__
+-	fbwscons_setcolormap(&rdev->sf, radeondrm_setcolor);
+-#else
+ 	radeondrm_setpal(rdev, ri);
+-#endif
+ 	drm_fb_helper_restore_fbdev_mode_unlocked(rdev_to_drm(rdev)->fb_helper);
+ 
+ 	if (rdev->switchcb)
+@@ -887,25 +880,6 @@
+ 	rasops_show_screen(ri, cookie, 0, NULL, NULL);
+ 	drm_fb_helper_debug_enter(fb_helper->info);
+ }
+-
+-#ifdef __sparc64__
+-void
+-radeondrm_setcolor(void *v, u_int index, u_int8_t r, u_int8_t g, u_int8_t b)
+-{
+-	struct sunfb *sf = v;
+-	struct radeon_device *rdev = sf->sf_ro.ri_hw;
+-
+-	/* see legacy_crtc_load_lut() */
+-	if (rdev->family < CHIP_RS600) {
+-		WREG8(RADEON_PALETTE_INDEX, index);
+-		WREG32(RADEON_PALETTE_30_DATA,
+-		    (r << 22) | (g << 12) | (b << 2));
+-	} else {
+-		printf("%s: setcolor family %d not handled\n",
+-		    rdev->self.dv_xname, rdev->family);
+-	}
+-}
+-#endif
+ 
+ void
+ radeondrm_setpal(struct radeon_device *rdev, struct rasops_info *ri)
+@@ -1167,7 +1141,10 @@
+ 	ri->ri_hw = rdev;
+ 	ri->ri_updatecursor = NULL;
+ 
+-	fbwscons_init(&rdev->sf, RI_VCONS | RI_WRONLY | RI_BSWAP, console);
++	/*
++	 * Keep the early Sun firmware console until DRM allocates its own buffer.
++	 */
++	fbwscons_init(&rdev->sf, RI_BSWAP, console);
+ 	if (console)
+ 		fbwscons_console_init(&rdev->sf, -1);
+ }
+@@ -1279,21 +1256,35 @@
+ 	else
+ 		format = NULL;
+ 
++	/*
++	 * If the firmware uses an 8bit console, keep that pixel format when
++	 * setting up the new KMS framebuffer.
++	 */
++#ifdef __sparc64__
++	if (rdev->sf.sf_depth == 8)
++		format = drm_format_info(DRM_FORMAT_C8);
++#endif
++
+ 	drm_client_setup(dev, format);
+ 
+ 	if (ri->ri_bits == NULL)
+ 		return;
+ 
+-#ifdef __sparc64__
+-	fbwscons_setcolormap(&rdev->sf, radeondrm_setcolor);
+-	ri = &rdev->sf.sf_ro;
+-#else
+ 	radeondrm_setpal(rdev, ri);
+ 	ri->ri_flg = RI_CENTER | RI_VCONS | RI_WRONLY;
++	/*
++	 * Centre the firmware text geometry in the new KMS mode.  Avoid
++	 * RI_FULLCLEAR during normal operation so erases stay inside the
++	 * text area; clear the margins once below with the console colour.
++	 */
++#ifdef __sparc64__
++	ri->ri_flg |= RI_BSWAP;
++	rasops_init(ri, rdev->sf.sf_ro.ri_rows, rdev->sf.sf_ro.ri_cols);
++#else
+ 	rasops_init(ri, 160, 160);
++#endif
+ 
+ 	ri->ri_hw = rdev;
+-#endif
+ 
+ 	radeondrm_stdscreen.capabilities = ri->ri_caps;
+ 	radeondrm_stdscreen.nrows = ri->ri_rows;
+@@ -1313,6 +1304,15 @@
+ 		uint32_t defattr;
+ 
+ 		ri->ri_ops.pack_attr(ri->ri_active, 0, 0, 0, &defattr);
++#ifdef __sparc64__
++		/*
++		 * Rasops has no full framebuffer clear, so use this workaround
++		 * to clear the margins too.
++		 */
++		ri->ri_flg |= RI_FULLCLEAR;
++		ri->ri_ops.eraserows(ri->ri_active, 0, ri->ri_rows, defattr);
++		ri->ri_flg &= ~RI_FULLCLEAR;
++#endif
+ 		wsdisplay_cnattach(&radeondrm_stdscreen, ri->ri_active,
+ 		    ri->ri_ccol, ri->ri_crow, defattr);
+ 	}
+--- sys/dev/rasops/rasops8.c
++++ sys/dev/rasops/rasops8.c
+@@ -50,6 +50,7 @@
+  */
+ static int32_t	stamp[16];
+ static uint32_t	stamp_attr;
++static struct rasops_info *stamp_ri;
+ static int	stamp_mutex;	/* XXX see note in README */
+ #endif
+ 
+@@ -170,6 +171,7 @@
+ 	fg = ri->ri_devcmap[(attr >> 24) & 0xf] & 0xff;
+ 	bg = ri->ri_devcmap[(attr >> 16) & 0xf] & 0xff;
+ 	stamp_attr = attr;
++	stamp_ri = ri;
+ 
+ 	for (i = 0; i < 16; i++) {
+ #if BYTE_ORDER == LITTLE_ENDIAN
+@@ -222,7 +224,7 @@
+ #endif
+ 
+ 	/* Recompute stamp? */
+-	if (attr != stamp_attr)
++	if (ri != stamp_ri || attr != stamp_attr)
+ 		rasops8_makestamp(ri, attr);
+ 
+ 	rp = (int32_t *)(ri->ri_bits + row*ri->ri_yscale + col*ri->ri_xscale);
+@@ -290,7 +292,7 @@
+ #endif
+ 
+ 	/* Recompute stamp? */
+-	if (attr != stamp_attr)
++	if (ri != stamp_ri || attr != stamp_attr)
+ 		rasops8_makestamp(ri, attr);
+ 
+ 	rp = (int32_t *)(ri->ri_bits + row*ri->ri_yscale + col*ri->ri_xscale);
+@@ -361,7 +363,7 @@
+ #endif
+ 
+ 	/* Recompute stamp? */
+-	if (attr != stamp_attr)
++	if (ri != stamp_ri || attr != stamp_attr)
+ 		rasops8_makestamp(ri, attr);
+ 
+ 	rp = (int32_t *)(ri->ri_bits + row*ri->ri_yscale + col*ri->ri_xscale);
