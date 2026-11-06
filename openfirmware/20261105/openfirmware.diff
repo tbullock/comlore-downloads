@@ -1,0 +1,114 @@
+--- a/sys/arch/sparc64/sparc64/ofw_machdep.c
++++ b/sys/arch/sparc64/sparc64/ofw_machdep.c
+@@ -260,6 +260,7 @@
+ 		cell_t ihandle;
+ 		cell_t len;
+ 		cell_t vaddr;
++		cell_t status;
+ 	} args;
+ 
+ 	if (mmuh == -1 && ((mmuh = get_mmu_handle()) == -1)) {
+@@ -268,7 +269,7 @@
+ 	}
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 4;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("release");
+ 	args.ihandle = HDL2CELL(mmuh);
+ 	args.vaddr = ADR2CELL(vaddr);
+@@ -293,6 +294,7 @@
+ 		cell_t ihandle;
+ 		cell_t len;
+ 		cell_t vaddr;
++		cell_t status;
+ 	} args;
+ 
+ 	if (mmuh == -1 && ((mmuh = get_mmu_handle()) == -1)) {
+@@ -301,7 +303,7 @@
+ 	}
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 4;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("unmap");
+ 	args.ihandle = HDL2CELL(mmuh);
+ 	args.vaddr = ADR2CELL(vaddr);
+@@ -328,6 +330,7 @@
+ 		cell_t vaddr;
+ 		cell_t phys_hi;
+ 		cell_t phys_lo;
++		cell_t status;
+ 	} args;
+ 
+ 	if (mmuh == -1 && ((mmuh = get_mmu_handle()) == -1)) {
+@@ -336,7 +339,7 @@
+ 	}
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 7;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("map");
+ 	args.ihandle = HDL2CELL(mmuh);
+ 	args.mode = mode;
+@@ -443,6 +446,7 @@
+ 		cell_t len;
+ 		cell_t phys_hi;
+ 		cell_t phys_lo;
++		cell_t status;
+ 	} args;
+ 
+ 	if (memh == -1 && ((memh = get_memory_handle()) == -1)) {
+@@ -451,7 +455,7 @@
+ 	}
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 5;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("release");
+ 	args.ihandle = HDL2CELL(memh);
+ 	args.len = len;
+--- a/sys/arch/sparc64/stand/ofwboot/Locore.c
++++ b/sys/arch/sparc64/stand/ofwboot/Locore.c
+@@ -420,11 +420,12 @@
+ 		cell_t ihandle;
+ 		cell_t len;
+ 		cell_t vaddr;
++		cell_t status;
+ 	} args;
+ 
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 4;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("release");
+ 	args.ihandle = HDL2CELL(mmuh);
+ 	args.vaddr = ADR2CELL(vaddr);
+@@ -452,11 +453,12 @@
+ 		cell_t vaddr;
+ 		cell_t paddr_hi;
+ 		cell_t paddr_lo;
++		cell_t status;
+ 	} args;
+ 
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 7;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("map");
+ 	args.ihandle = HDL2CELL(mmuh);
+ 	args.mode = mode;
+@@ -519,11 +521,12 @@
+ 		cell_t len;
+ 		cell_t phys_hi;
+ 		cell_t phys_lo;
++		cell_t status;
+ 	} args;
+ 
+ 	args.name = ADR2CELL("call-method");
+ 	args.nargs = 5;
+-	args.nreturns = 0;
++	args.nreturns = 1;
+ 	args.method = ADR2CELL("release");
+ 	args.ihandle = HDL2CELL(memh);
+ 	args.len = len;
